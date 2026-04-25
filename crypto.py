@@ -1,0 +1,594 @@
+"""
+scanners/crypto.py
+Smart Money crypto scanner — ported from AXIFLOW/main.py
+Analyzes 20 crypto futures pairs using pure market structure:
+FVG, Order Blocks, Liquidity Sweeps, CVD, AMD, OI, Funding, Liquidations
+"""
+import asyncio
+import time
+import logging
+import math
+from dataclasses import dataclass, field
+from typing import Optional
+import httpx
+
+log = logging.getLogger("crypto_scanner")
+
+BFUT = "https://fapi.binance.com"
+
+SYMBOLS = [
+    "BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT",
+    "ADAUSDT", "DOGEUSDT", "AVAXUSDT", "DOTUSDT", "LINKUSDT",
+    "LTCUSDT", "MATICUSDT", "ATOMUSDT", "NEARUSDT", "APTUSDT",
+    "ARBUSDT", "OPUSDT", "INJUSDT", "SUIUSDT", "TIAUSDT",
+]
+
+
+@dataclass
+class Signal:
+    symbol:     str
+    decision:   str
+    confidence: int
+    strategy:   str
+    entry:      float
+    tp:         float
+    sl:         float
+    rr:         float
+    move_pct:   float
+    lev:        int
+    reasons:    list
+    structure:  dict
+    ts:         float = field(default_factory=time.time)
+
+    def to_dict(self):
+        return {
+            "symbol":     self.symbol,
+            "decision":   self.decision,
+            "confidence": self.confidence,
+            "strategy":   self.strategy,
+            "entry":      self.entry,
+            "tp":         round(self.tp, 6),
+            "sl":         round(self.sl, 6),
+            "rr":         round(self.rr, 2),
+            "move_pct":   round(self.move_pct, 2),
+            "lev":        self.lev,
+            "reasons":    self.reasons,
+            "raw":        self.structure,
+            "ts":         self.ts,
+        }
+
+
+# ── HTTP ──────────────────────────────────────────────────────
+async def _get(url, params=None):
+    try:
+        async with httpx.AsyncClient(timeout=8) as c:
+            r = await c.get(url, params=params)
+            r.raise_for_status()
+            return r.json()
+    except Exception as e:
+        log.debug(f"GET {url}: {e}")
+        return None
+
+
+# ── DATA FETCHERS ─────────────────────────────────────────────
+async def get_ticker(sym):
+    d = await _get(f"{BFUT}/fapi/v1/ticker/24hr", {"symbol": sym})
+    if not d: return None
+    return {
+        "price":  float(d["lastPrice"]),
+        "change": float(d["priceChangePercent"]),
+        "volume": float(d["quoteVolume"]),
+        "high":   float(d["highPrice"]),
+        "low":    float(d["lowPrice"]),
+    }
+
+async def get_klines(sym, tf="5m", limit=150):
+    d = await _get(f"{BFUT}/fapi/v1/klines", {"symbol": sym, "interval": tf, "limit": limit})
+    if not d: return []
+    return [{"o": float(x[1]), "h": float(x[2]), "l": float(x[3]),
+             "c": float(x[4]), "v": float(x[5]), "t": int(x[0])} for x in d]
+
+async def get_oi(sym):
+    now  = await _get(f"{BFUT}/fapi/v1/openInterest", {"symbol": sym})
+    hist = await _get(f"{BFUT}/futures/data/openInterestHist",
+                      {"symbol": sym, "period": "5m", "limit": 24})
+    if not now:
+        return {"delta_15m": 0, "delta_1h": 0, "delta_4h": 0,
+                "strength": 0, "current": 0, "trend": "flat"}
+    cur  = float(now["openInterest"])
+    vals = [float(h["sumOpenInterest"]) for h in (hist or [])]
+    p15  = vals[-3]  if len(vals) >= 3  else cur
+    p1h  = vals[-12] if len(vals) >= 12 else cur
+    p4h  = vals[-24] if len(vals) >= 24 else cur
+    d15  = (cur - p15) / max(p15, 1) * 100
+    d1h  = (cur - p1h) / max(p1h, 1) * 100
+    d4h  = (cur - p4h) / max(p4h, 1) * 100
+    trend = "rising" if d1h > 2 else "falling" if d1h < -2 else "flat"
+    return {"current": cur, "delta_15m": d15, "delta_1h": d1h, "delta_4h": d4h,
+            "strength": 2 if abs(d15) > 5 else 1 if abs(d15) > 2 else 0,
+            "trend": trend}
+
+async def get_funding(sym):
+    d = await _get(f"{BFUT}/fapi/v1/premiumIndex", {"symbol": sym})
+    fr = float(d["lastFundingRate"]) if d else 0
+    return {"rate": fr, "extreme_long": fr > 0.01, "extreme_short": fr < -0.01,
+            "bullish": fr < -0.005, "bearish": fr > 0.005}
+
+async def get_liqs(sym):
+    d = await _get(f"{BFUT}/fapi/v1/allForceOrders", {"symbol": sym, "limit": 500})
+    if not d:
+        return {"ratio": 1.0, "long_vol": 0, "short_vol": 0,
+                "strength": 0, "total": 0, "dominant": "none"}
+    lv = sum(float(o["origQty"]) * float(o["price"]) for o in d if o.get("side") == "SELL")
+    sv = sum(float(o["origQty"]) * float(o["price"]) for o in d if o.get("side") == "BUY")
+    total = lv + sv
+    r = lv / max(sv, 1)
+    dominant = "longs" if r > 2 else "shorts" if r < 0.5 else "balanced"
+    return {"ratio": r, "long_vol": lv, "short_vol": sv, "total": total,
+            "strength": 2 if r > 3 or r < 0.33 else 1 if r > 2 or r < 0.5 else 0,
+            "dominant": dominant}
+
+async def get_ob(sym, depth=100):
+    d = await _get(f"{BFUT}/fapi/v1/depth", {"symbol": sym, "limit": depth})
+    if not d:
+        return {"imbalance": 0, "strength": 0, "bid_wall": 0, "ask_wall": 0}
+    bids = d.get("bids", [])
+    asks = d.get("asks", [])
+    bv = sum(float(b[1]) for b in bids)
+    av = sum(float(a[1]) for a in asks)
+    total = bv + av
+    imb = (bv - av) / total if total else 0
+    bid_wall = max((float(b[1]) for b in bids), default=0)
+    ask_wall = max((float(a[1]) for a in asks), default=0)
+    return {"bid": bv, "ask": av, "imbalance": imb,
+            "strength": 2 if abs(imb) > 0.2 else 1 if abs(imb) > 0.1 else 0,
+            "bid_wall": bid_wall, "ask_wall": ask_wall}
+
+
+# ── SMART MONEY STRUCTURE ─────────────────────────────────────
+def detect_fvg(candles, lookback=30):
+    fvgs = []
+    data = candles[-lookback:]
+    for i in range(2, len(data)):
+        c0 = data[i-2]; c2 = data[i]
+        if c2["l"] > c0["h"]:
+            fvgs.append({"type": "bullish", "top": c2["l"], "bot": c0["h"],
+                         "mid": (c2["l"] + c0["h"]) / 2,
+                         "size": (c2["l"] - c0["h"]) / c0["h"] * 100, "idx": i})
+        elif c2["h"] < c0["l"]:
+            fvgs.append({"type": "bearish", "top": c0["l"], "bot": c2["h"],
+                         "mid": (c0["l"] + c2["h"]) / 2,
+                         "size": (c0["l"] - c2["h"]) / c0["l"] * 100, "idx": i})
+    sig = [f for f in fvgs if f["size"] > 0.1]
+    return sig[-5:] if sig else []
+
+
+def detect_order_blocks(candles, lookback=50):
+    obs = []
+    data = candles[-lookback:]
+    avg_size = sum(abs(c["c"] - c["o"]) for c in data) / max(len(data), 1)
+    for i in range(1, len(data) - 2):
+        c = data[i]; next_c = data[i + 1]
+        body = abs(c["c"] - c["o"]); next_body = abs(next_c["c"] - next_c["o"])
+        if c["c"] < c["o"] and next_c["c"] > next_c["o"] and next_body > avg_size * 1.5:
+            obs.append({"type": "bullish", "top": c["o"], "bot": c["c"],
+                        "mid": (c["o"] + c["c"]) / 2, "idx": i})
+        elif c["c"] > c["o"] and next_c["c"] < next_c["o"] and next_body > avg_size * 1.5:
+            obs.append({"type": "bearish", "top": c["c"], "bot": c["o"],
+                        "mid": (c["c"] + c["o"]) / 2, "idx": i})
+    return obs[-5:] if obs else []
+
+
+def detect_liquidity_sweep(candles, lookback=50):
+    data = candles[-lookback:]
+    if len(data) < 10:
+        return {"bull_sweep": False, "bear_sweep": False}
+    recent = data[:-3]; last3 = data[-3:]
+    prev_high = max(c["h"] for c in recent)
+    prev_low  = min(c["l"] for c in recent)
+    last_high = max(c["h"] for c in last3)
+    last_low  = min(c["l"] for c in last3)
+    last_close = data[-1]["c"]
+    bull_sweep = last_low < prev_low and last_close > prev_low
+    bear_sweep = last_high > prev_high and last_close < prev_high
+    sweep_pct_bull = (prev_low - last_low) / prev_low * 100 if bull_sweep else 0
+    sweep_pct_bear = (last_high - prev_high) / prev_high * 100 if bear_sweep else 0
+    return {"bull_sweep": bull_sweep, "bear_sweep": bear_sweep,
+            "sweep_pct_bull": sweep_pct_bull, "sweep_pct_bear": sweep_pct_bear,
+            "prev_high": prev_high, "prev_low": prev_low}
+
+
+def detect_cvd_divergence(candles):
+    if len(candles) < 20:
+        return {"divergence": 0, "absorption": False}
+    cvd_vals = []
+    cum = 0.0
+    for c in candles:
+        delta = c["v"] if c["c"] >= c["o"] else -c["v"]
+        cum += delta
+        cvd_vals.append(cum)
+    period = 10
+    price_start = candles[-period]["c"]; price_end = candles[-1]["c"]
+    cvd_start = cvd_vals[-period]; cvd_end = cvd_vals[-1]
+    price_up = price_end > price_start * 1.001
+    price_dn = price_end < price_start * 0.999
+    cvd_up = cvd_end > cvd_start * 1.001 if cvd_start != 0 else cvd_end > cvd_start
+    cvd_dn = cvd_end < cvd_start * 0.999 if cvd_start != 0 else cvd_end < cvd_start
+    divergence = 0
+    if price_up and cvd_dn: divergence = -1
+    if price_dn and cvd_up: divergence = 1
+    last = candles[-1]
+    avg_vol  = sum(c["v"] for c in candles[-20:]) / 20
+    avg_body = sum(abs(c["c"] - c["o"]) for c in candles[-20:]) / 20
+    body_now = abs(last["c"] - last["o"])
+    absorption = last["v"] > avg_vol * 2 and body_now < avg_body * 0.5
+    return {"divergence": divergence, "absorption": absorption,
+            "cvd_current": cvd_end,
+            "cvd_trend": "rising" if cvd_up else "falling" if cvd_dn else "flat",
+            "price_trend": "rising" if price_up else "falling" if price_dn else "flat"}
+
+
+def detect_liq_clusters(candles):
+    if len(candles) < 30:
+        return {"clusters_above": [], "clusters_below": []}
+    tol = 0.002
+    highs = [c["h"] for c in candles[-50:]]
+    lows  = [c["l"] for c in candles[-50:]]
+    clusters_above = []
+    for i, h in enumerate(highs):
+        similar = [hh for hh in highs[i+1:] if abs(hh - h) / h < tol]
+        if len(similar) >= 2:
+            clusters_above.append(round(h, 4))
+    clusters_below = []
+    for i, l in enumerate(lows):
+        similar = [ll for ll in lows[i+1:] if abs(ll - l) / l < tol]
+        if len(similar) >= 2:
+            clusters_below.append(round(l, 4))
+    return {"clusters_above": list(set(clusters_above))[:3],
+            "clusters_below": list(set(clusters_below))[:3]}
+
+
+def detect_amd(candles_5m, oi_delta):
+    if len(candles_5m) < 20:
+        return {"confirmed": False}
+    recent = candles_5m[-20:]
+    highs = [c["h"] for c in recent]; lows = [c["l"] for c in recent]; vols = [c["v"] for c in recent]
+    pr = (max(highs) - min(lows)) / max(min(lows), 1) * 100
+    if pr >= 3.0: return {"confirmed": False}
+    rt, rb = max(highs), min(lows)
+    tol = pr * 0.12
+    top_t = sum(1 for h in highs if abs(h - rt) / max(rt, 1) * 100 < tol)
+    bot_t = sum(1 for l in lows  if abs(l - rb) / max(rb, 1) * 100 < tol)
+    if top_t < 2 and bot_t < 2: return {"confirmed": False}
+    if not (vols[-1] < vols[0] and 0 <= oi_delta <= 5):
+        return {"active": True, "confirmed": False}
+    avg_v = sum(vols[:-3]) / max(len(vols[:-3]), 1)
+    avg_s = sum(c["h"] - c["l"] for c in recent[:-3]) / max(len(recent[:-3]), 1)
+    for c in candles_5m[-5:]:
+        bt   = c["h"] > rt * 1.002
+        bb   = c["l"] < rb * 0.998
+        back = rb < candles_5m[-1]["c"] < rt
+        spike = c["v"] > avg_v * 1.3 or (c["h"] - c["l"]) > avg_s * 1.3
+        if (bt or bb) and back and spike:
+            return {"confirmed": True, "fake": "up" if bt else "down",
+                    "signal": "SHORT" if bt else "LONG",
+                    "fvg_top": rt, "fvg_bot": rb, "range_pct": round(pr, 2)}
+    return {"active": True, "confirmed": False}
+
+
+def vol_ratio(candles):
+    if len(candles) < 20: return 1.0
+    avg = sum(c["v"] for c in candles[-20:-5]) / 15
+    rec = sum(c["v"] for c in candles[-5:]) / 5
+    return rec / max(avg, 0.001)
+
+
+# ── SCORING ───────────────────────────────────────────────────
+def sm_score(ticker, oi, funding, liqs, ob,
+             cvd_5m, fvg_5m, obs_5m, sweep_5m, liq_clusters,
+             cvd_1h, sweep_1h, amd, vr):
+    score = 0.0
+    reasons = []
+    confluence = []
+
+    price = ticker["price"]
+    change = ticker["change"]
+
+    if sweep_5m["bull_sweep"]:
+        score += 2.0
+        reasons.append(f"💧 Bull Liquidity Sweep: взяли стопи нижче, ціна повернулась ({sweep_5m['sweep_pct_bull']:.2f}%)")
+        confluence.append("bull_sweep")
+    if sweep_5m["bear_sweep"]:
+        score -= 2.0
+        reasons.append(f"💧 Bear Liquidity Sweep: взяли стопи вище, ціна впала ({sweep_5m['sweep_pct_bear']:.2f}%)")
+        confluence.append("bear_sweep")
+    if sweep_1h["bull_sweep"]:
+        score += 1.0; reasons.append("💧 Bull Sweep підтверджений на 1H структурі")
+    if sweep_1h["bear_sweep"]:
+        score -= 1.0; reasons.append("💧 Bear Sweep підтверджений на 1H структурі")
+
+    for fvg in (fvg_5m[-3:] if fvg_5m else []):
+        if fvg["type"] == "bullish" and fvg["bot"] <= price <= fvg["top"]:
+            score += 1.5
+            reasons.append(f"📐 Ціна в Bullish FVG зоні: ${fvg['bot']:.4f}–${fvg['top']:.4f} ({fvg['size']:.2f}%)")
+            confluence.append("fvg_bull")
+        elif fvg["type"] == "bearish" and fvg["bot"] <= price <= fvg["top"]:
+            score -= 1.5
+            reasons.append(f"📐 Ціна в Bearish FVG зоні: ${fvg['bot']:.4f}–${fvg['top']:.4f} ({fvg['size']:.2f}%)")
+            confluence.append("fvg_bear")
+
+    for ob_zone in (obs_5m or [])[-3:]:
+        if ob_zone["type"] == "bullish" and ob_zone["bot"] <= price <= ob_zone["top"] * 1.005:
+            score += 1.5
+            reasons.append(f"🟩 Bullish Order Block: ${ob_zone['bot']:.4f}–${ob_zone['top']:.4f}")
+            confluence.append("ob_bull")
+        elif ob_zone["type"] == "bearish" and ob_zone["bot"] * 0.995 <= price <= ob_zone["top"]:
+            score -= 1.5
+            reasons.append(f"🟥 Bearish Order Block: ${ob_zone['bot']:.4f}–${ob_zone['top']:.4f}")
+            confluence.append("ob_bear")
+
+    if cvd_5m["divergence"] == 1:
+        score += 1.5; reasons.append("📊 Bullish CVD дивергенція: ціна ↓ але об'єм купівлі ↑")
+        confluence.append("cvd_bull")
+    elif cvd_5m["divergence"] == -1:
+        score -= 1.5; reasons.append("📊 Bearish CVD дивергенція: ціна ↑ але об'єм продажу ↑")
+        confluence.append("cvd_bear")
+    if cvd_5m["absorption"]:
+        if change > 0:
+            score += 0.8; reasons.append("🧲 Absorption: великий об'єм без руху = накопичення")
+        else:
+            score -= 0.8; reasons.append("🧲 Absorption: великий об'єм без руху = дистрибуція")
+
+    d15 = oi["delta_15m"]; d1h = oi["delta_1h"]
+    price_up = change > 0
+    if d15 > 5:
+        score += 1.5; reasons.append(f"📈 OI +{d15:.1f}% за 15хв — агресивне відкриття")
+    elif d15 > 2 and price_up:
+        score += 1.0; reasons.append(f"📈 OI +{d15:.1f}% + ціна ↑ — накопичення лонгів")
+    elif d15 > 2 and not price_up:
+        score -= 1.0; reasons.append(f"📈 OI +{d15:.1f}% + ціна ↓ — накопичення шортів")
+    elif d15 < -3:
+        score -= 0.8; reasons.append(f"📉 OI −{abs(d15):.1f}% — закриття позицій")
+    if d1h > 5:
+        score += 0.5; reasons.append(f"📈 OI +{d1h:.1f}% за 1H — сильний тренд")
+
+    fr = funding["rate"]
+    if funding["extreme_long"]:
+        score -= 1.5; reasons.append(f"💸 Funding перекупленість {fr*100:.4f}% — SHORT тиск")
+    elif funding["extreme_short"]:
+        score += 1.5; reasons.append(f"💸 Funding перепроданість {fr*100:.4f}% — LONG тиск")
+    elif funding["bearish"]:
+        score -= 0.5; reasons.append(f"💸 Funding {fr*100:.4f}% — помірний ведмежий тиск")
+    elif funding["bullish"]:
+        score += 0.5; reasons.append(f"💸 Funding {fr*100:.4f}% — помірний бичачий тиск")
+
+    r = liqs["ratio"]
+    if r > 3:
+        score += 1.5; reasons.append(f"💥 Масові лонг-ліквідації x{r:.1f} → бичачий розворот")
+        confluence.append("liq_bull")
+    elif r > 2:
+        score += 1.0; reasons.append(f"💥 Лонг-ліквідації x{r:.1f} → бичачий сигнал")
+    elif r < 0.33:
+        score -= 1.5; reasons.append(f"💥 Масові шорт-ліквідації x{1/max(r,.001):.1f} → ведмежий розворот")
+        confluence.append("liq_bear")
+    elif r < 0.5:
+        score -= 1.0; reasons.append(f"💥 Шорт-ліквідації x{1/max(r,.001):.1f} → ведмежий сигнал")
+
+    im = ob["imbalance"]
+    if im > 0.25:
+        score += 1.2; reasons.append(f"📖 OB сильний тиск покупців {im:+.2f}")
+    elif im > 0.12:
+        score += 0.6; reasons.append(f"📖 OB тиск покупців {im:+.2f}")
+    elif im < -0.25:
+        score -= 1.2; reasons.append(f"📖 OB сильний тиск продавців {im:+.2f}")
+    elif im < -0.12:
+        score -= 0.6; reasons.append(f"📖 OB тиск продавців {im:+.2f}")
+
+    clusters_above = liq_clusters.get("clusters_above", [])
+    clusters_below = liq_clusters.get("clusters_below", [])
+    if clusters_above:
+        nearest = min(clusters_above, key=lambda x: abs(x - price))
+        if abs(nearest - price) / price < 0.02:
+            score += 0.5; reasons.append(f"🎯 Liquidity cluster above: ${nearest:.4f}")
+    if clusters_below:
+        nearest = min(clusters_below, key=lambda x: abs(x - price))
+        if abs(nearest - price) / price < 0.02:
+            score -= 0.5; reasons.append(f"🎯 Liquidity cluster below: ${nearest:.4f}")
+
+    amd_active = False
+    if amd.get("confirmed"):
+        amd_score = 4.0 if amd["signal"] == "LONG" else -4.0
+        score += amd_score
+        amd_active = True
+        reasons.insert(0, f"⚡ AMD підтверджений: фейк {amd['fake'].upper()} → {amd['signal']} | FVG ${amd['fvg_bot']:.2f}–${amd['fvg_top']:.2f}")
+
+    if vr < 0.4:
+        reasons.append(f"⚠️ Дуже низький об'єм {vr:.0%} — обережно")
+        score *= 0.6
+
+    bull_conf = sum(1 for c in confluence if "bull" in c)
+    bear_conf = sum(1 for c in confluence if "bear" in c)
+    if bull_conf >= 3:
+        score += 0.8; reasons.append(f"🔗 Confluence: {bull_conf} бичачих сигналів збіглись")
+    if bear_conf >= 3:
+        score -= 0.8; reasons.append(f"🔗 Confluence: {bear_conf} ведмежих сигналів збіглись")
+
+    return score, reasons, amd_active
+
+
+# ── TP/SL ─────────────────────────────────────────────────────
+def calc_tp_sl(price, direction, candles, fvgs, obs, liq_clusters, ticker):
+    high24 = ticker["high"]; low24 = ticker["low"]
+    recent = candles[-20:]
+    avg_range = sum(c["h"] - c["l"] for c in recent) / len(recent)
+    atr = avg_range * 1.2
+
+    if direction == "LONG":
+        sl_candidates = [price - atr * 1.5]
+        for ob_z in (obs or []):
+            if ob_z["type"] == "bullish" and ob_z["bot"] < price:
+                sl_candidates.append(ob_z["bot"] * 0.998)
+        for fvg in (fvgs or []):
+            if fvg["type"] == "bullish" and fvg["bot"] < price:
+                sl_candidates.append(fvg["bot"] * 0.998)
+        sl = max(sl_candidates)
+        tp_candidates = [price + atr * 4]
+        for fvg in sorted((f for f in (fvgs or []) if f["type"] == "bearish" and f["bot"] > price), key=lambda x: x["bot"]):
+            tp_candidates.append(fvg["mid"] * 0.998); break
+        for cl in sorted((c for c in liq_clusters.get("clusters_above", []) if c > price)):
+            tp_candidates.append(cl * 0.999); break
+        if high24 > price * 1.02:
+            tp_candidates.append(high24 * 0.999)
+        valid_tps = [p for p in tp_candidates if p > price + atr * 3]
+        tp = max(valid_tps) if valid_tps else price + atr * 4
+    else:
+        sl_candidates = [price + atr * 1.5]
+        for ob_z in (obs or []):
+            if ob_z["type"] == "bearish" and ob_z["top"] > price:
+                sl_candidates.append(ob_z["top"] * 1.002)
+        for fvg in (fvgs or []):
+            if fvg["type"] == "bearish" and fvg["top"] > price:
+                sl_candidates.append(fvg["top"] * 1.002)
+        sl = min(sl_candidates)
+        tp_candidates = [price - atr * 4]
+        for fvg in sorted((f for f in (fvgs or []) if f["type"] == "bullish" and f["top"] < price), key=lambda x: -x["top"]):
+            tp_candidates.append(fvg["mid"] * 1.002); break
+        for cl in sorted((c for c in liq_clusters.get("clusters_below", []) if c < price), reverse=True):
+            tp_candidates.append(cl * 1.001); break
+        if low24 < price * 0.98:
+            tp_candidates.append(low24 * 1.001)
+        valid_tps = [p for p in tp_candidates if p < price - atr * 3]
+        tp = min(valid_tps) if valid_tps else price - atr * 4
+
+    sl_dist = abs(price - sl)
+    tp_dist = abs(price - tp)
+    rr = tp_dist / max(sl_dist, 0.0001)
+    move_pct = tp_dist / price * 100
+    return tp, sl, rr, move_pct
+
+
+# ── MAIN ANALYSIS ─────────────────────────────────────────────
+async def analyze_symbol(sym: str, cache: dict) -> Optional[dict]:
+    try:
+        ticker, c5m, c1h, oi, funding, liqs, ob_data = await asyncio.gather(
+            get_ticker(sym),
+            get_klines(sym, "5m", 150),
+            get_klines(sym, "1h", 50),
+            get_oi(sym),
+            get_funding(sym),
+            get_liqs(sym),
+            get_ob(sym, 100),
+        )
+
+        if not ticker or len(c5m) < 30:
+            return None
+
+        price = ticker["price"]
+        fvg_5m       = detect_fvg(c5m, 50)
+        obs_5m       = detect_order_blocks(c5m, 80)
+        sweep_5m     = detect_liquidity_sweep(c5m, 50)
+        cvd_5m       = detect_cvd_divergence(c5m)
+        liq_clusters = detect_liq_clusters(c5m)
+        amd          = detect_amd(c5m, oi["delta_15m"])
+        sweep_1h     = detect_liquidity_sweep(c1h, 30)
+        cvd_1h       = detect_cvd_divergence(c1h)
+        vr           = vol_ratio(c5m)
+
+        score, reasons, amd_active = sm_score(
+            ticker, oi, funding, liqs, ob_data,
+            cvd_5m, fvg_5m, obs_5m, sweep_5m, liq_clusters,
+            cvd_1h, sweep_1h, amd, vr
+        )
+
+        if score >= 3.0:    direction = "LONG"
+        elif score <= -3.0: direction = "SHORT"
+        else:               direction = "NO TRADE"
+
+        structure = {
+            "price": price, "change": ticker["change"], "score": round(score, 2),
+            "oi_15m": oi["delta_15m"], "oi_1h": oi["delta_1h"],
+            "funding": funding["rate"], "liq_ratio": liqs["ratio"],
+            "ob_imb": ob_data["imbalance"], "cvd_div": cvd_5m["divergence"],
+            "fvg_count": len(fvg_5m), "ob_count": len(obs_5m),
+            "bull_sweep": sweep_5m["bull_sweep"], "bear_sweep": sweep_5m["bear_sweep"],
+            "amd": amd.get("confirmed", False), "vol_ratio": vr,
+        }
+
+        if direction == "NO TRADE":
+            result = Signal(sym, "NO TRADE", 0, "STANDARD", price, price, price, 0, 0, 1,
+                            reasons[:3] if reasons else [f"Score {score:.1f} | Нема чіткої структури"],
+                            structure).to_dict()
+            cache[sym] = result
+            return result
+
+        tp, sl, rr, move_pct = calc_tp_sl(price, direction, c5m, fvg_5m, obs_5m, liq_clusters, ticker)
+
+        if rr < 3.0:
+            result = Signal(sym, "NO TRADE", 0, "STANDARD", price, price, price, 0, 0, 1,
+                            [f"RR {rr:.1f}:1 < 1:3 — пропускаємо"], structure).to_dict()
+            cache[sym] = result
+            return result
+
+        if move_pct < 2.0:
+            result = Signal(sym, "NO TRADE", 0, "STANDARD", price, price, price, 0, 0, 1,
+                            [f"Рух {move_pct:.1f}% < 2% — нецікаво"], structure).to_dict()
+            cache[sym] = result
+            return result
+
+        base_conf = 40 + abs(score) * 7
+        if amd_active:               base_conf += 20
+        if rr >= 5:                  base_conf += 10
+        if rr >= 4:                  base_conf += 5
+        if move_pct >= 5:            base_conf += 5
+        if sweep_5m["bull_sweep"] or sweep_5m["bear_sweep"]: base_conf += 8
+        if len(fvg_5m) > 0:          base_conf += 5
+        conf = min(95, max(35, int(base_conf)))
+        lev  = 5 if conf >= 85 else 3 if conf >= 75 else 2 if conf >= 65 else 1
+
+        strategy = "AMD_FVG" if amd_active else (
+            "SWEEP" if (sweep_5m["bull_sweep"] or sweep_5m["bear_sweep"]) else
+            "FVG" if fvg_5m else "OB" if obs_5m else "STANDARD"
+        )
+
+        sig = Signal(sym, direction, conf, strategy, price, tp, sl, rr, move_pct, lev, reasons[:6], structure)
+        cache[sym] = sig.to_dict()
+        log.info(f"[{sym}] {direction} conf={conf}% RR={rr:.1f} move={move_pct:.1f}% strat={strategy}")
+        return cache[sym]
+
+    except Exception as e:
+        log.error(f"analyze {sym}: {e}")
+        return None
+
+
+# ── SCANNER CLASS ─────────────────────────────────────────────
+class CryptoScanner:
+    def __init__(self):
+        self.cache: dict = {}
+        self._prev_decisions: dict = {}
+
+    async def scan_all(self) -> list[dict]:
+        """Scan all symbols, return only new high-confidence signals (confidence >= 70)."""
+        new_signals = []
+        for sym in SYMBOLS:
+            result = await analyze_symbol(sym, self.cache)
+            if not result:
+                continue
+            decision = result.get("decision", "NO TRADE")
+            conf = result.get("confidence", 0)
+            prev_decision = self._prev_decisions.get(sym)
+            if decision != "NO TRADE" and conf >= 70 and decision != prev_decision:
+                new_signals.append(result)
+            self._prev_decisions[sym] = decision
+            await asyncio.sleep(0.3)
+        return new_signals
+
+    async def analyze_specific(self, symbol: str) -> Optional[dict]:
+        """Analyze a specific symbol for /analyze command."""
+        sym = symbol.upper()
+        if not sym.endswith("USDT"):
+            sym += "USDT"
+        return await analyze_symbol(sym, self.cache)
+
+    def get_snapshot(self) -> list[dict]:
+        """Return current cache snapshot for /hunt and /pulse."""
+        return list(self.cache.values())
