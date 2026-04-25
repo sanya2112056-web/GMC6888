@@ -12,7 +12,9 @@ from telegram.constants import ParseMode
 from telegram.error import TelegramError
 
 from agent import CountAgent
-from scanners import CryptoScanner, FreelanceScanner, MarketPulseScanner
+from scanners.crypto import CryptoScanner
+from scanners.freelance import FreelanceScanner
+from scanners.market_pulse import MarketPulseScanner
 
 log = logging.getLogger("bot")
 
